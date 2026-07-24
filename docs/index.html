@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1220">
+<title>Fool Me Thrice — real or fake?</title>
+<meta name="description" content="Swipe through news claims about India. Spot the fakes. Three wrong answers and you're out.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕵️</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main id="app">
+
+  <!-- intro -->
+  <section id="screen-intro" class="screen">
+    <div class="intro-box">
+      <div class="logo">🕵️</div>
+      <h1>Fool Me <em>Thrice</em></h1>
+      <p class="tagline">Real headlines. Real misinformation.<br>Can you tell them apart?</p>
+      <ul class="rules">
+        <li><span>👉</span> Swipe right if you think it's <b class="real-word">REAL</b></li>
+        <li><span>👈</span> Swipe left if you think it's <b class="fake-word">FAKE</b></li>
+        <li><span>💔</span> Three wrong answers ends your run</li>
+      </ul>
+      <button id="btn-start" class="btn-primary" disabled>Loading cards…</button>
+      <p class="credit">Fakes are genuine misinformation debunked by
+        <a href="https://factcheck.pib.gov.in" target="_blank" rel="noopener">PIB Fact Check</a>.
+        Reals are drawn from official PIB press releases.</p>
+    </div>
+  </section>
+
+  <!-- game -->
+  <section id="screen-game" class="screen hidden">
+    <header class="hud">
+      <div id="hud-score" class="hud-score">0</div>
+      <div class="hud-title">Fool Me Thrice</div>
+      <div id="hud-lives" class="hud-lives"></div>
+    </header>
+
+    <div id="stack" class="stack">
+      <article id="card-next" class="card card-under" aria-hidden="true">
+        <div class="card-cat"></div>
+        <p class="card-claim"></p>
+      </article>
+      <article id="card" class="card">
+        <div id="card-cat" class="card-cat"></div>
+        <p id="card-claim" class="card-claim"></p>
+        <div id="stamp-real" class="stamp stamp-real">REAL</div>
+        <div id="stamp-fake" class="stamp stamp-fake">FAKE</div>
+      </article>
+    </div>
+
+    <div class="controls">
+      <button id="btn-fake" class="btn-round btn-fake" aria-label="Mark as fake">✕<small>FAKE</small></button>
+      <button id="btn-real" class="btn-round btn-real" aria-label="Mark as real">✓<small>REAL</small></button>
+    </div>
+  </section>
+
+  <!-- reveal sheet -->
+  <div id="sheet" class="sheet hidden">
+    <div id="sheet-body" class="sheet-body">
+      <div id="sheet-result" class="sheet-result"></div>
+      <div id="sheet-verdict" class="sheet-verdict"></div>
+      <p id="sheet-explain" class="sheet-explain"></p>
+      <a id="sheet-source" class="sheet-source" href="#" target="_blank" rel="noopener">See the source ↗</a>
+      <button id="btn-next" class="btn-primary">Next card</button>
+    </div>
+  </div>
+
+  <!-- game over -->
+  <section id="screen-over" class="screen hidden">
+    <div class="intro-box">
+      <div id="over-emoji" class="logo"></div>
+      <h2 id="over-title"></h2>
+      <p id="over-detail" class="tagline"></p>
+      <div class="over-stats">
+        <div><b id="over-score">0</b><span>correct</span></div>
+        <div><b id="over-best">0</b><span>your best</span></div>
+      </div>
+      <button id="btn-share" class="btn-primary">Share result</button>
+      <button id="btn-again" class="btn-secondary">Play again</button>
+      <p id="share-copied" class="credit hidden">Result copied to clipboard ✓</p>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

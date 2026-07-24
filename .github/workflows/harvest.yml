@@ -1,0 +1,26 @@
+name: harvest
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 08:30 IST daily — yesterday's PIB list is complete
+  workflow_dispatch:
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r harvest/requirements.txt
+
+      - name: Run harvest
+        run: python harvest/harvest.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
