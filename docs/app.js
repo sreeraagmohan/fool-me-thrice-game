@@ -60,7 +60,7 @@ const CATEGORY_LABELS = {
 };
 
 function show(screenId) {
-  for (const s of ["screen-intro", "screen-game", "screen-over"]) {
+  for (const s of ["screen-intro", "screen-game", "screen-over", "screen-about"]) {
     $(s).classList.toggle("hidden", s !== screenId);
   }
 }
@@ -111,6 +111,21 @@ function startGame() {
   show("screen-game");
 }
 
+/** Anonymous fire-and-forget answer log for per-card difficulty stats.
+ *  Harmless no-op until the answers table + insert policy exist. */
+function logAnswer(card, guess, correct) {
+  fetch(`${SUPABASE_URL}/rest/v1/answers`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_KEY,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ card_id: card.id, guess, correct }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
 function answer(guess, viaSwipe, dx) {
   if (state.answering) return;
   const card = cardAt(state.index);
@@ -118,6 +133,7 @@ function answer(guess, viaSwipe, dx) {
   state.answering = true;
 
   const correct = guess === card.verdict;
+  logAnswer(card, guess, correct);
   if (correct) state.score += 1;
   else state.wrong += 1;
   renderHud();
@@ -245,6 +261,8 @@ async function boot() {
 
   $("btn-start").addEventListener("click", startGame);
   $("btn-again").addEventListener("click", startGame);
+  $("btn-about").addEventListener("click", () => show("screen-about"));
+  $("btn-about-back").addEventListener("click", () => show("screen-intro"));
   $("btn-next").addEventListener("click", nextCard);
   $("btn-share").addEventListener("click", shareResult);
   $("btn-real").addEventListener("click", () => answer("REAL", false, 0));

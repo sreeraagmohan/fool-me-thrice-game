@@ -7,7 +7,7 @@
 <title>Fool Me Thrice — real or fake?</title>
 <meta name="description" content="Swipe through news claims about India. Spot the fakes. Three wrong answers and you're out.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕵️</text></svg>">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 
@@ -28,6 +28,37 @@
       <p class="credit">Fakes are genuine misinformation debunked by
         <a href="https://factcheck.pib.gov.in" target="_blank" rel="noopener">PIB Fact Check</a>.
         Reals are drawn from official PIB press releases.</p>
+      <button id="btn-about" class="btn-link">About this game</button>
+    </div>
+  </section>
+
+  <!-- about -->
+  <section id="screen-about" class="screen hidden">
+    <div class="intro-box about-box">
+      <div class="logo">🕵️</div>
+      <h2>About Fool Me Thrice</h2>
+      <div class="about-text">
+        <p>Every card in this game is real — even the fake ones. The
+        <b class="fake-word">FAKE</b> claims are genuine misinformation that
+        actually circulated on Indian social media, officially debunked by the
+        government's fact-checking unit, PIB Fact Check. Nothing here is
+        AI-invented fake news.</p>
+        <p>The <b class="real-word">REAL</b> claims come from official PIB
+        press releases, rewritten in the same casual register — so you can't
+        judge by tone, only by judgment.</p>
+        <p>I built this because telling truth from viral fiction is a skill,
+        and skills need practice. I write
+        <a href="https://thebharatbriefing.beehiiv.com/" target="_blank" rel="noopener">The
+        Bharat Briefing</a>, a newsletter on Indian government policy, business
+        and geopolitics — this game is a side quest in the same mission.</p>
+      </div>
+      <nav class="about-links">
+        <a href="https://www.linkedin.com/in/sreeraagmohan/" target="_blank" rel="noopener">Sreeraag on LinkedIn ↗</a>
+        <a href="https://thebharatbriefing.beehiiv.com/" target="_blank" rel="noopener">The Bharat Briefing ↗</a>
+        <a href="https://factcheck.pib.gov.in" target="_blank" rel="noopener">PIB Fact Check ↗</a>
+        <a href="https://www.pib.gov.in/allRel.aspx" target="_blank" rel="noopener">PIB Press Releases ↗</a>
+      </nav>
+      <button id="btn-about-back" class="btn-secondary">← Back</button>
     </div>
   </section>
 
@@ -87,6 +118,6 @@
 
 </main>
 
-<script src="app.js?v=2"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>

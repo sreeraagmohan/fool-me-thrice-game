@@ -111,6 +111,40 @@ h2 { font-size: 30px; }
 .credit { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
 .credit a { color: #aab3ff; }
 
+.btn-link {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: #aab3ff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.about-box { text-align: left; overflow-y: auto; max-height: 100%; }
+.about-box .logo, .about-box h2 { text-align: center; }
+.about-text { display: flex; flex-direction: column; gap: 12px; }
+.about-text p { color: #cdd2ee; font-size: 15px; line-height: 1.6; }
+.about-text a { color: #aab3ff; }
+
+.about-links {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--bg-soft);
+  border: 1px solid #262b4a;
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.about-links a {
+  color: #aab3ff;
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
 .over-stats {
   display: flex;
   justify-content: center;
