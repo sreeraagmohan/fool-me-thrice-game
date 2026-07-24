@@ -7,7 +7,7 @@
 <title>Fool Me Thrice — real or fake?</title>
 <meta name="description" content="Swipe through news claims about India. Spot the fakes. Three wrong answers and you're out.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕵️</text></svg>">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 
@@ -72,11 +72,17 @@
 
     <div id="stack" class="stack">
       <article id="card-next" class="card card-under" aria-hidden="true">
-        <div class="card-cat"></div>
+        <div class="card-meta">
+          <span class="card-cat"></span>
+          <span class="card-date"></span>
+        </div>
         <p class="card-claim"></p>
       </article>
       <article id="card" class="card">
-        <div id="card-cat" class="card-cat"></div>
+        <div class="card-meta">
+          <span id="card-cat" class="card-cat"></span>
+          <span id="card-date" class="card-date"></span>
+        </div>
         <p id="card-claim" class="card-claim"></p>
         <div id="stamp-real" class="stamp stamp-real">REAL</div>
         <div id="stamp-fake" class="stamp stamp-fake">FAKE</div>
@@ -118,6 +124,6 @@
 
 </main>
 
-<script src="app.js?v=4"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>

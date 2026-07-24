@@ -212,8 +212,14 @@ h2 { font-size: 30px; }
   filter: brightness(.85);
 }
 
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .card-cat {
-  align-self: flex-start;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: .1em;
@@ -223,6 +229,14 @@ h2 { font-size: 30px; }
   border-radius: 999px;
   padding: 6px 12px;
 }
+
+.card-date {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  color: #9498b5;
+}
+.card-date:empty { display: none; }
 
 .card-claim {
   font-size: clamp(20px, 5.4vw, 27px);

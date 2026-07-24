@@ -21,7 +21,7 @@ const state = {
 async function fetchCards() {
   const url =
     `${SUPABASE_URL}/rest/v1/cards` +
-    `?select=id,verdict,claim,category,explanation,source_url&active=eq.true`;
+    `?select=id,verdict,claim,category,explanation,source_url,source_date&active=eq.true`;
   const resp = await fetch(url, { headers: { apikey: SUPABASE_KEY } });
   if (!resp.ok) throw new Error(`Supabase ${resp.status}`);
   const rows = await resp.json();
@@ -76,10 +76,18 @@ function cardAt(i) {
   return state.deck[i] || null;
 }
 
+function formatDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return "";
+  return d.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+}
+
 function fillCard(el, card) {
   el.querySelector(".card-cat").textContent = card
     ? CATEGORY_LABELS[card.category] || card.category
     : "";
+  el.querySelector(".card-date").textContent = card ? formatDate(card.source_date) : "";
   el.querySelector(".card-claim").textContent = card ? card.claim : "";
 }
 

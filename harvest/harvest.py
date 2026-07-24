@@ -207,12 +207,20 @@ def _parse_release_links(page_html: str) -> list:
 
 
 def fetch_release_list() -> list:
-    """English press releases for today AND yesterday (IST): [(prid, title)].
+    """English press releases: [(prid, title)].
 
-    The plain GET shows today's (possibly still short) list; yesterday's
-    complete list is reached through the page's ASP.NET date-filter postback.
+    Covers today (plain GET) plus BACKFILL_DAYS previous days, plus
+    HISTORICAL_DAYS randomly sampled days from 2020 onward — historical
+    sampling keeps the REAL pool's date distribution overlapping the FAKE
+    pool's, so recency never becomes a tell. Past days are reached through
+    the page's ASP.NET date-filter postback.
     """
+    import random
+    from datetime import timedelta
     from zoneinfo import ZoneInfo
+
+    backfill_days = int(os.environ.get("BACKFILL_DAYS", "1"))
+    historical_days = int(os.environ.get("HISTORICAL_DAYS", "2"))
 
     session = requests.Session()
     session.headers["User-Agent"] = UA
@@ -229,22 +237,33 @@ def fetch_release_list() -> list:
     if "__VIEWSTATE" not in hidden:
         raise HarvestError("allRel.aspx: __VIEWSTATE not found — page structure changed")
 
-    yday = datetime.now(ZoneInfo("Asia/Kolkata")).date().toordinal() - 1
-    yday = datetime.fromordinal(yday).date()
-    post = session.post(
-        ALLREL_URL,
-        data={
-            **hidden,
-            "__EVENTTARGET": "ctl00$ContentPlaceHolder1$ddlday",
-            "ctl00$ContentPlaceHolder1$ddlMinistry": "0",
-            "ctl00$ContentPlaceHolder1$ddlday": str(yday.day),
-            "ctl00$ContentPlaceHolder1$ddlMonth": str(yday.month),
-            "ctl00$ContentPlaceHolder1$ddlYear": str(yday.year),
-        },
-        timeout=45,
-    )
-    post.raise_for_status()
-    releases += _parse_release_links(post.text)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    dates = [today - timedelta(days=n) for n in range(1, backfill_days + 1)]
+    hist_start = datetime(2020, 1, 1).date()
+    hist_span = (today - timedelta(days=90) - hist_start).days
+    dates += [
+        hist_start + timedelta(days=random.randrange(hist_span))
+        for _ in range(historical_days)
+    ]
+
+    for d in dates:
+        post = session.post(
+            ALLREL_URL,
+            data={
+                **hidden,
+                "__EVENTTARGET": "ctl00$ContentPlaceHolder1$ddlday",
+                "ctl00$ContentPlaceHolder1$ddlMinistry": "0",
+                "ctl00$ContentPlaceHolder1$ddlday": str(d.day),
+                "ctl00$ContentPlaceHolder1$ddlMonth": str(d.month),
+                "ctl00$ContentPlaceHolder1$ddlYear": str(d.year),
+            },
+            timeout=45,
+        )
+        post.raise_for_status()
+        day_links = _parse_release_links(post.text)
+        log(f"allRel {d.isoformat()}: {len(day_links)} releases")
+        releases += day_links
+        time.sleep(0.3)
 
     seen, out = set(), []
     for prid, title in releases:
@@ -253,10 +272,14 @@ def fetch_release_list() -> list:
             out.append((prid, title))
     if len(out) < MIN_ALLREL_LINKS:
         raise HarvestError(
-            f"allRel.aspx: only {len(out)} release links across today+yesterday "
+            f"allRel.aspx: only {len(out)} release links across {len(dates) + 1} days "
             f"(expected >= {MIN_ALLREL_LINKS}) — page structure may have changed"
         )
-    log(f"allRel: {len(out)} releases listed (today + yesterday IST)")
+    # Shuffle so the per-run cap samples uniformly across today + historical
+    # days, rather than exhausting today's (larger) list first — this is what
+    # keeps the REAL pool's date distribution spread out.
+    random.shuffle(out)
+    log(f"allRel: {len(out)} unique releases listed")
     return out
 
 
@@ -348,11 +371,13 @@ CARD_SCHEMA = {
                 "properties": {
                     "id": {"type": "string"},
                     "usable": {"type": "boolean"},
+                    "share_score": {"type": "integer"},
                     "claim": {"type": "string"},
                     "category": {"type": "string", "enum": CATEGORIES},
                     "explanation": {"type": "string"},
                 },
-                "required": ["id", "usable", "claim", "category", "explanation"],
+                "required": ["id", "usable", "share_score", "claim",
+                             "category", "explanation"],
                 "additionalProperties": False,
             },
         }
@@ -361,42 +386,63 @@ CARD_SCHEMA = {
     "additionalProperties": False,
 }
 
-FAKE_SYSTEM = """You turn debunked misinformation into cards for a real-vs-fake news game.
+JUDGEABILITY = """A card is only good if a thoughtful player has something to REASON about. The claim must be fully self-contained:
+- Specific: name the concrete thing alleged or announced. Never vague references like "accusations against X" or "a confidential letter" whose contents the player cannot know.
+- Anchored: if the claim is tied to an event or period, anchor it in the claim itself using the DATE provided (e.g. "during the May 2025 India-Pakistan clashes", "at the height of the 2020 lockdown"). A floating "an army post was destroyed" is unjudgeable; anchored, it becomes reasoning material.
+- No insider knowledge required: mark unusable anything a player could only judge by having seen a specific document, image, or account (morphed screenshots with no specific claim, confidential letters, fake handles of obscure officials)."""
 
-Each input is a tweet by PIB Fact Check (Indian government) debunking a claim that circulated on social media. For each item produce:
+FAKE_SYSTEM = f"""You turn debunked misinformation into cards for a real-vs-fake news game.
+
+Each input is a tweet by PIB Fact Check (Indian government) debunking a claim that circulated on social media, with the DATE it circulated. For each item produce:
 - claim: the FALSE claim itself, restated as a confident assertion in under 200 characters — the way it circulated on WhatsApp/social media, in casual, informal English. Never include words like "fake", "fact check", "debunked", "claim", or hashtags. No emoji. Write it so a player cannot tell from style alone whether it is true.
+- share_score: honest 1-5 rating of how viral/share-worthy the claim reads (analytics only).
 - category: one of the allowed values.
 - explanation: ONE sentence a player sees after answering, explaining why the claim is false and what PIB Fact Check found. Start with something other than "The claim".
-- usable: false only if the tweet contains no specific checkable claim (e.g. generic media-literacy advice). Fraudulent-website and fake-account alerts ARE usable (phrase them as the false promise, e.g. a scheme/website offering something).
+- usable: judged by the standard below. Fraudulent-website and job-scam alerts ARE usable when phrased as the false promise they made.
+
+{JUDGEABILITY}
 
 Return every input item exactly once, using its id."""
 
-REAL_SYSTEM = """You turn official Indian government press releases into cards for a real-vs-fake news game.
+REAL_SYSTEM = f"""You turn official Indian government press releases into cards for a real-vs-fake news game.
 
-Each input is a genuine PIB (Press Information Bureau) press release. For each item produce:
-- claim: the release's single most newsworthy concrete fact, restated as a confident assertion in under 200 characters, in the SAME casual, informal register as viral social-media claims — NOT press-release officialese. No honorifics ("Shri"), no "today", no dates relative to now. It must stay factually accurate to the release. Write it so a player cannot tell from style alone whether it is true.
+Players see a claim and guess REAL or FAKE. The FAKE pool is sensational viral misinformation, so a REAL card must hold its own as shareable news — the kind of fact a person would actually forward to a family WhatsApp group.
+
+For each input item (a genuine PIB press release with its DATE):
+- Find the single most share-worthy fact in the release: surprising, consequential, or delightfully specific. Ask: would a normal person retell this to a friend? Most press releases contain no such fact — that is expected.
+- share_score: honest 1-5 rating (5 = would genuinely go viral; 3 = mildly interesting; 1 = only a bureaucrat cares). Most releases deserve 1-2.
+- claim: the fact as a confident, informal assertion under 200 characters, phrased the way a person would retell it — never press-release officialese. Frame ANNOUNCEMENTS and decisions, not tallied statistics ("NHAI will pay you for reporting dirty highway toilets", not "NHAI rewarded 429 commuters with Rs 1000"). AT MOST one number, rounded the way people speak ("Rs 1 lakh crore", "nearly 30 years"). Never stack statistics. No honorifics, no "today". Must stay factually accurate to the release; for older releases, phrase it so it reads correctly with its DATE (anchor the year when it matters).
 - category: one of the allowed values.
-- explanation: ONE sentence a player sees after answering, confirming the fact and citing the PIB press release as the source.
-- usable: false if the release is purely ceremonial (tributes, birthday homages, photo ops) or contains no concrete, interesting fact for a general audience.
+- explanation: ONE sentence shown after answering, confirming the fact and citing the PIB press release as the source.
+- usable: false if ceremonial, routine administrative business, share_score of 3 or less, or it fails the standard below.
+
+{JUDGEABILITY}
 
 Return every input item exactly once, using its id."""
 
 
-def normalize_with_claude(client, system: str, items: list) -> tuple:
-    """items: [{id, text}] -> (validated card dicts, unusable real ids).
+def normalize_with_claude(client, system: str, items: list, min_share: int = 0) -> tuple:
+    """items: [{id, text, date}] -> (validated card dicts, unusable real ids).
 
     Claude only ever sees short synthetic ids (batch positions) so it cannot
     mangle 19-digit tweet ids; we map back to real ids afterwards. Items it
-    declares unusable are returned separately so callers can tombstone them
-    and never pay for them again. Items dropped by OUR validation are in
-    neither list and will be retried on a future run.
+    declares unusable — or that score below min_share — are returned
+    separately so callers can tombstone them and never pay for them again.
+    Items dropped by OUR validation are in neither list and will be retried
+    on a future run.
     """
     cards_out, unusable = [], []
     for i in range(0, len(items), NORMALIZE_BATCH_SIZE):
         batch = items[i : i + NORMALIZE_BATCH_SIZE]
         idmap = {str(n): it["id"] for n, it in enumerate(batch)}
         payload = json.dumps(
-            [{"id": str(n), "text": it["text"]} for n, it in enumerate(batch)],
+            [
+                {
+                    "id": str(n),
+                    "text": f"DATE: {it.get('date') or 'unknown'}\n{it['text']}",
+                }
+                for n, it in enumerate(batch)
+            ],
             ensure_ascii=False,
         )
         response = client.messages.create(
@@ -417,7 +463,12 @@ def normalize_with_claude(client, system: str, items: list) -> tuple:
             if real_id is None:
                 warn(f"claude returned unknown batch id {card['id']!r}; dropping")
                 continue
-            if not card["usable"]:
+            # share_score is an analytics/gating hint, not a quality signal —
+            # an out-of-range value coerces to 0 (fails any share gate) rather
+            # than dropping the item into permanent retry limbo.
+            score = card.get("share_score")
+            score = score if isinstance(score, int) and 1 <= score <= 5 else 0
+            if not card["usable"] or score < min_share:
                 unusable.append(real_id)
                 continue
             claim = card["claim"].strip()
@@ -438,13 +489,18 @@ def normalize_with_claude(client, system: str, items: list) -> tuple:
 
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
+    refresh = "--refresh" in sys.argv  # re-normalize & overwrite existing rows
     cfg = load_env()
 
     import anthropic
     client = anthropic.Anthropic(api_key=cfg["anthropic_key"])
 
-    existing = fetch_existing_source_ids(cfg)
-    log(f"supabase: {len(existing)} existing cards")
+    if refresh:
+        existing = set()
+        log("REFRESH mode: re-normalizing everything and overwriting in place")
+    else:
+        existing = fetch_existing_source_ids(cfg)
+        log(f"supabase: {len(existing)} existing cards")
 
     # ---- FAKE pool ------------------------------------------------------
     tweets = fetch_syndication_tweets()
@@ -499,9 +555,12 @@ def main() -> None:
         return
 
     # ---- normalize ------------------------------------------------------
+    # Fakes are kept regardless of virality (they are real misinformation);
+    # reals must clear a share-worthiness bar so they can stand next to them.
     fake_cards, fake_skip = (normalize_with_claude(client, FAKE_SYSTEM, new_tweets)
                              if new_tweets else ([], []))
-    real_cards, real_skip = (normalize_with_claude(client, REAL_SYSTEM, new_releases)
+    real_cards, real_skip = (normalize_with_claude(client, REAL_SYSTEM, new_releases,
+                                                    min_share=4)
                              if new_releases else ([], []))
 
     for pool, inputs, cards, skips in (("fake", new_tweets, fake_cards, fake_skip),
@@ -552,8 +611,14 @@ def main() -> None:
         log(f"DRY RUN: would upsert {len(rows)} rows "
             f"({len(fake_cards)} fake, {len(real_cards)} real, "
             f"{len(fake_skip) + len(real_skip)} tombstones)")
-        for r in rows[:5]:
-            log(f"  sample: [{r['verdict']}/{r['category']}] {r['claim']}")
+        for label, cards, verdict, url_key in (
+            ("FAKE", fake_cards, "FAKE", "tweet"),
+            ("REAL", real_cards, "REAL", "pib"),
+        ):
+            log(f"\n=== {label} samples ({len(cards)}) ===")
+            for c in cards:
+                d = dates.get(c["id"]) or "????"
+                log(f"  [{d[:7]} {c['category']}] {c['claim']}")
         return
 
     upsert_cards(cfg, rows)
