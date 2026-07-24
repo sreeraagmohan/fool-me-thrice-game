@@ -359,6 +359,22 @@ def upsert_cards(cfg: dict, cards: list) -> None:
         raise HarvestError(f"supabase upsert failed: HTTP {resp.status_code} {resp.text[:300]}")
 
 
+def deactivate_all_cards(cfg: dict) -> None:
+    """Set every card inactive. Used only in --refresh so that cards NOT
+    re-processed this run (old-prompt leftovers) are retired instead of
+    lingering in a mixed deck; the refresh's upsert immediately switches the
+    freshly-regenerated good cards back to active."""
+    resp = requests.patch(
+        f"{cfg['supabase_url']}/rest/v1/cards",
+        headers={**supabase_headers(cfg), "Prefer": "return=minimal"},
+        params={"active": "eq.true"},
+        data=json.dumps({"active": False}),
+        timeout=60,
+    )
+    if resp.status_code not in (200, 204):
+        raise HarvestError(f"deactivate failed: HTTP {resp.status_code} {resp.text[:300]}")
+
+
 # ------------------------------------------------------ claude normalization
 
 CARD_SCHEMA = {
@@ -409,12 +425,12 @@ REAL_SYSTEM = f"""You turn official Indian government press releases into cards 
 Players see a claim and guess REAL or FAKE. The FAKE pool is sensational viral misinformation, so a REAL card must hold its own as shareable news — the kind of fact a person would actually forward to a family WhatsApp group.
 
 For each input item (a genuine PIB press release with its DATE):
-- Find the single most share-worthy fact in the release: surprising, consequential, or delightfully specific. Ask: would a normal person retell this to a friend? Most press releases contain no such fact — that is expected.
+- Find the single most share-worthy fact in the release: a decision, launch, new rule, first-of-its-kind achievement, or a surprising qualitative fact. Ask: would a normal person retell this to a friend? Most press releases contain no such fact — that is expected.
 - share_score: honest 1-5 rating (5 = would genuinely go viral; 3 = mildly interesting; 1 = only a bureaucrat cares). Most releases deserve 1-2.
-- claim: the fact as a confident, informal assertion under 200 characters, phrased the way a person would retell it — never press-release officialese. Frame ANNOUNCEMENTS and decisions, not tallied statistics ("NHAI will pay you for reporting dirty highway toilets", not "NHAI rewarded 429 commuters with Rs 1000"). AT MOST one number, rounded the way people speak ("Rs 1 lakh crore", "nearly 30 years"). Never stack statistics. No honorifics, no "today". Must stay factually accurate to the release; for older releases, phrase it so it reads correctly with its DATE (anchor the year when it matters).
+- claim: the fact as a confident, informal assertion under 200 characters, phrased the way a person would retell it — never press-release officialese. Frame the ANNOUNCEMENT, decision, or event — NOT a tally. Reject any fact whose punchline is a cumulative total, count, or aggregate figure, even reframed as savings or impact: "the government will pay people for reporting dirty highway toilets" is good; "NHAI rewarded 429 commuters", "20,000 Jan Aushadhi centres opened", and "generic medicines saved Indians Rs 45,000 crore" are all BAD (mark them unusable). A single number is allowed only when it IS the surprise (a "Rs 1 lakh crore fund", "the 4th country ever to dock spacecraft") — never a running total. No honorifics, no "today". Must stay factually accurate to the release; for older releases, phrase it so it reads correctly with its DATE (anchor the year when it matters).
 - category: one of the allowed values.
 - explanation: ONE sentence shown after answering, confirming the fact and citing the PIB press release as the source.
-- usable: false if ceremonial, routine administrative business, share_score of 3 or less, or it fails the standard below.
+- usable: false if ceremonial, routine administrative business, a tallied statistic (per above), share_score of 3 or less, or it fails the standard below.
 
 {JUDGEABILITY}
 
@@ -431,7 +447,7 @@ def normalize_with_claude(client, system: str, items: list, min_share: int = 0) 
     Items dropped by OUR validation are in neither list and will be retried
     on a future run.
     """
-    cards_out, unusable = [], []
+    cards_out, unusable, done = [], [], set()
     for i in range(0, len(items), NORMALIZE_BATCH_SIZE):
         batch = items[i : i + NORMALIZE_BATCH_SIZE]
         idmap = {str(n): it["id"] for n, it in enumerate(batch)}
@@ -447,7 +463,7 @@ def normalize_with_claude(client, system: str, items: list, min_share: int = 0) 
         )
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=4000,
+            max_tokens=8000,
             system=system,
             output_config={"format": {"type": "json_schema", "schema": CARD_SCHEMA}},
             messages=[{"role": "user", "content": payload}],
@@ -456,13 +472,24 @@ def normalize_with_claude(client, system: str, items: list, min_share: int = 0) 
         try:
             cards = json.loads(text)["cards"]
         except (json.JSONDecodeError, KeyError) as e:
-            raise HarvestError(f"claude returned unparseable output ({e}): {text[:200]}")
+            # A single truncated/garbled batch must not abort the whole run —
+            # its items are neither kept nor tombstoned, so they retry next
+            # time. The pool-level sanity floor below still catches systemic
+            # breakage (e.g. every batch failing).
+            warn(f"batch at offset {i} unparseable ({e}); skipping, will retry")
+            if response.stop_reason == "max_tokens":
+                warn(f"  (hit max_tokens — batch of {len(batch)} too large)")
+            continue
 
         for card in cards:
             real_id = idmap.get(card["id"])
             if real_id is None:
                 warn(f"claude returned unknown batch id {card['id']!r}; dropping")
                 continue
+            if real_id in done:  # Claude repeated an id in its response
+                warn(f"{real_id}: duplicate in claude output; dropping repeat")
+                continue
+            done.add(real_id)
             # share_score is an analytics/gating hint, not a quality signal —
             # an out-of-range value coerces to 0 (fails any share gate) rather
             # than dropping the item into permanent retry limbo.
@@ -607,6 +634,18 @@ def main() -> None:
         r["source_id"] = f"pib:{sid}"
         rows.append(r)
 
+    # Final guard: one row per source_id (Postgres rejects an upsert batch
+    # that touches the same conflict key twice). Accepted cards are appended
+    # before tombstones, so keeping the first occurrence prefers the card.
+    deduped, seen_sids = [], set()
+    for r in rows:
+        if r["source_id"] not in seen_sids:
+            seen_sids.add(r["source_id"])
+            deduped.append(r)
+    if len(deduped) != len(rows):
+        warn(f"dropped {len(rows) - len(deduped)} duplicate source_id rows before upsert")
+    rows = deduped
+
     if dry_run:
         log(f"DRY RUN: would upsert {len(rows)} rows "
             f"({len(fake_cards)} fake, {len(real_cards)} real, "
@@ -620,6 +659,19 @@ def main() -> None:
                 d = dates.get(c["id"]) or "????"
                 log(f"  [{d[:7]} {c['category']}] {c['claim']}")
         return
+
+    # In refresh mode, retire every existing card immediately before writing
+    # the regenerated set, so no old-prompt card survives in a mixed deck.
+    # Guard: refuse to wipe the deck if this run produced almost nothing.
+    if refresh:
+        active_new = len(fake_cards) + len(real_cards)
+        if active_new < 20:
+            raise HarvestError(
+                f"refresh produced only {active_new} active cards — refusing to "
+                "deactivate the live deck for so few replacements"
+            )
+        deactivate_all_cards(cfg)
+        log("refresh: deactivated all prior cards")
 
     upsert_cards(cfg, rows)
     log(
