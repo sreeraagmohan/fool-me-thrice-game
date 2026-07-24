@@ -382,13 +382,23 @@ Each input is a genuine PIB (Press Information Bureau) press release. For each i
 Return every input item exactly once, using its id."""
 
 
-def normalize_with_claude(client, system: str, items: list) -> list:
-    """items: [{id, text}] -> validated card dicts (may be fewer than input)."""
-    out = []
+def normalize_with_claude(client, system: str, items: list) -> tuple:
+    """items: [{id, text}] -> (validated card dicts, unusable real ids).
+
+    Claude only ever sees short synthetic ids (batch positions) so it cannot
+    mangle 19-digit tweet ids; we map back to real ids afterwards. Items it
+    declares unusable are returned separately so callers can tombstone them
+    and never pay for them again. Items dropped by OUR validation are in
+    neither list and will be retried on a future run.
+    """
+    cards_out, unusable = [], []
     for i in range(0, len(items), NORMALIZE_BATCH_SIZE):
         batch = items[i : i + NORMALIZE_BATCH_SIZE]
-        payload = json.dumps([{"id": it["id"], "text": it["text"]} for it in batch],
-                             ensure_ascii=False)
+        idmap = {str(n): it["id"] for n, it in enumerate(batch)}
+        payload = json.dumps(
+            [{"id": str(n), "text": it["text"]} for n, it in enumerate(batch)],
+            ensure_ascii=False,
+        )
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=4000,
@@ -402,25 +412,26 @@ def normalize_with_claude(client, system: str, items: list) -> list:
         except (json.JSONDecodeError, KeyError) as e:
             raise HarvestError(f"claude returned unparseable output ({e}): {text[:200]}")
 
-        batch_ids = {it["id"] for it in batch}
         for card in cards:
-            if card["id"] not in batch_ids:
-                warn(f"claude invented id {card['id']!r}; dropping")
+            real_id = idmap.get(card["id"])
+            if real_id is None:
+                warn(f"claude returned unknown batch id {card['id']!r}; dropping")
                 continue
             if not card["usable"]:
+                unusable.append(real_id)
                 continue
             claim = card["claim"].strip()
             expl = card["explanation"].strip()
             if not (10 <= len(claim) <= 200):
-                warn(f"{card['id']}: claim length {len(claim)} out of range; dropping")
+                warn(f"{real_id}: claim length {len(claim)} out of range; dropping")
                 continue
             if not expl or len(expl) > 300:
-                warn(f"{card['id']}: bad explanation; dropping")
+                warn(f"{real_id}: bad explanation; dropping")
                 continue
-            out.append({"id": card["id"], "claim": claim,
-                        "category": card["category"], "explanation": expl})
+            cards_out.append({"id": real_id, "claim": claim,
+                              "category": card["category"], "explanation": expl})
         time.sleep(0.5)
-    return out
+    return cards_out, unusable
 
 
 # ------------------------------------------------------------------- main
@@ -488,55 +499,68 @@ def main() -> None:
         return
 
     # ---- normalize ------------------------------------------------------
-    fake_cards = normalize_with_claude(client, FAKE_SYSTEM, new_tweets) if new_tweets else []
-    real_cards = normalize_with_claude(client, REAL_SYSTEM, new_releases) if new_releases else []
+    fake_cards, fake_skip = (normalize_with_claude(client, FAKE_SYSTEM, new_tweets)
+                             if new_tweets else ([], []))
+    real_cards, real_skip = (normalize_with_claude(client, REAL_SYSTEM, new_releases)
+                             if new_releases else ([], []))
 
-    for pool, inputs, cards in (("fake", new_tweets, fake_cards),
-                                ("real", new_releases, real_cards)):
-        if inputs and len(cards) < len(inputs) * 0.3:
+    for pool, inputs, cards, skips in (("fake", new_tweets, fake_cards, fake_skip),
+                                       ("real", new_releases, real_cards, real_skip)):
+        if inputs and (len(cards) + len(skips)) < len(inputs) * 0.5:
             raise HarvestError(
-                f"{pool} pool: only {len(cards)}/{len(inputs)} items survived "
-                "normalization — prompt or source drift; refusing to write"
+                f"{pool} pool: only {len(cards) + len(skips)}/{len(inputs)} items "
+                "processed cleanly — prompt or source drift; refusing to write"
             )
 
+    def row(card, verdict, url, date, tombstone=False):
+        return {
+            "source_id": None,  # filled in by the caller
+            "verdict": verdict,
+            "claim": card["claim"] if not tombstone else "[skipped during normalization]",
+            "category": card["category"] if not tombstone else "misc",
+            "explanation": card["explanation"] if not tombstone
+            else "Source item judged unusable for the game.",
+            "source_url": url,
+            "source_date": date,
+            "active": not tombstone,
+        }
+
     dates = {it["id"]: it["date"] for it in new_tweets + new_releases}
-    rows = [
-        {
-            "source_id": f"tweet:{c['id']}",
-            "verdict": "FAKE",
-            "claim": c["claim"],
-            "category": c["category"],
-            "explanation": c["explanation"],
-            "source_url": f"https://x.com/PIBFactCheck/status/{c['id']}",
-            "source_date": dates.get(c["id"]),
-        }
-        for c in fake_cards
-    ] + [
-        {
-            "source_id": f"pib:{c['id']}",
-            "verdict": "REAL",
-            "claim": c["claim"],
-            "category": c["category"],
-            "explanation": c["explanation"],
-            "source_url": f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={c['id']}",
-            "source_date": dates.get(c["id"]),
-        }
-        for c in real_cards
-    ]
+    rows = []
+    for c in fake_cards:
+        r = row(c, "FAKE", f"https://x.com/PIBFactCheck/status/{c['id']}", dates.get(c["id"]))
+        r["source_id"] = f"tweet:{c['id']}"
+        rows.append(r)
+    for c in real_cards:
+        r = row(c, "REAL", f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={c['id']}",
+                dates.get(c["id"]))
+        r["source_id"] = f"pib:{c['id']}"
+        rows.append(r)
+    # tombstones: recorded inactive so they are never re-normalized
+    for sid in fake_skip:
+        r = row(None, "FAKE", f"https://x.com/PIBFactCheck/status/{sid}",
+                dates.get(sid), tombstone=True)
+        r["source_id"] = f"tweet:{sid}"
+        rows.append(r)
+    for sid in real_skip:
+        r = row(None, "REAL", f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={sid}",
+                dates.get(sid), tombstone=True)
+        r["source_id"] = f"pib:{sid}"
+        rows.append(r)
 
     if dry_run:
-        log(f"DRY RUN: would upsert {len(rows)} cards "
-            f"({len(fake_cards)} fake, {len(real_cards)} real)")
+        log(f"DRY RUN: would upsert {len(rows)} rows "
+            f"({len(fake_cards)} fake, {len(real_cards)} real, "
+            f"{len(fake_skip) + len(real_skip)} tombstones)")
         for r in rows[:5]:
             log(f"  sample: [{r['verdict']}/{r['category']}] {r['claim']}")
         return
 
     upsert_cards(cfg, rows)
     log(
-        f"DONE: upserted {len(rows)} cards "
-        f"({len(fake_cards)} fake, {len(real_cards)} real); "
-        f"dropped {len(new_tweets) - len(fake_cards)} fake / "
-        f"{len(new_releases) - len(real_cards)} real as unusable"
+        f"DONE: upserted {len(fake_cards)} fake + {len(real_cards)} real cards, "
+        f"tombstoned {len(fake_skip) + len(real_skip)} unusable items; "
+        f"{len(new_tweets) + len(new_releases) - len(rows)} left for retry"
     )
 
 
