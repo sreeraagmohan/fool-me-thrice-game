@@ -22,8 +22,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import collections
+
 import requests
 from bs4 import BeautifulSoup
+
+import feeds
 
 # ---------------------------------------------------------------- config
 
@@ -46,6 +50,10 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 NORMALIZE_BATCH_SIZE = 10
 MAX_NEW_RELEASES_PER_RUN = int(os.environ.get("MAX_NEW_RELEASES_PER_RUN", "60"))
 MAX_NEW_TWEETS_PER_RUN = int(os.environ.get("MAX_NEW_TWEETS_PER_RUN", "120"))
+MAX_NEW_FACTCHECK_PER_RUN = int(os.environ.get("MAX_NEW_FACTCHECK_PER_RUN", "80"))
+MAX_NEW_NEWS_PER_RUN = int(os.environ.get("MAX_NEW_NEWS_PER_RUN", "200"))
+FACTCHECK_PAGES = int(os.environ.get("FACTCHECK_PAGES", "6"))
+NEWS_PAGES = int(os.environ.get("NEWS_PAGES", "3"))
 
 # Sanity floors: if a source yields less than this, its page structure has
 # almost certainly changed and we must not write anything derived from it.
@@ -342,10 +350,27 @@ def fetch_existing_source_ids(cfg: dict) -> set:
         offset += page
 
 
+NEW_COLUMNS = ("valence", "source_type")
+
+
 def upsert_cards(cfg: dict, cards: list) -> None:
+    """Upsert, degrading gracefully if the valence/source_type migration has
+    not been applied yet — better to keep the deck fresh than to hard-fail on
+    two analytics columns."""
     if not cards:
         return
-    resp = requests.post(
+    resp = _post_cards(cfg, cards)
+    if resp.status_code == 400 and any(c in resp.text for c in NEW_COLUMNS):
+        warn("valence/source_type columns missing — writing without them. "
+             "Apply the migration to enable balance tracking.")
+        stripped = [{k: v for k, v in c.items() if k not in NEW_COLUMNS} for c in cards]
+        resp = _post_cards(cfg, stripped)
+    if resp.status_code not in (200, 201, 204):
+        raise HarvestError(f"supabase upsert failed: HTTP {resp.status_code} {resp.text[:300]}")
+
+
+def _post_cards(cfg: dict, cards: list):
+    return requests.post(
         f"{cfg['supabase_url']}/rest/v1/cards",
         headers={
             **supabase_headers(cfg),
@@ -355,8 +380,6 @@ def upsert_cards(cfg: dict, cards: list) -> None:
         data=json.dumps(cards),
         timeout=60,
     )
-    if resp.status_code not in (200, 201, 204):
-        raise HarvestError(f"supabase upsert failed: HTTP {resp.status_code} {resp.text[:300]}")
 
 
 def deactivate_all_cards(cfg: dict) -> None:
@@ -390,10 +413,12 @@ CARD_SCHEMA = {
                     "share_score": {"type": "integer"},
                     "claim": {"type": "string"},
                     "category": {"type": "string", "enum": CATEGORIES},
+                    "valence": {"type": "string",
+                                "enum": ["positive", "negative", "neutral"]},
                     "explanation": {"type": "string"},
                 },
                 "required": ["id", "usable", "share_score", "claim",
-                             "category", "explanation"],
+                             "category", "valence", "explanation"],
                 "additionalProperties": False,
             },
         }
@@ -401,6 +426,21 @@ CARD_SCHEMA = {
     "required": ["cards"],
     "additionalProperties": False,
 }
+
+SCOPE = """SCOPE — keep the game out of live political disputes. Apply this precisely; do NOT over-apply it.
+
+IN SCOPE — use these freely, they are the substance of the game:
+government schemes, policy, budgets, regulations and rules; health and medicine; science, space and technology; business and the economy; infrastructure and transport; agriculture; education; sport; wildlife and the environment; consumer scams and frauds; records, firsts and milestones; disasters and accidents whose facts are established.
+Mentioning a ministry, a minister, a government programme or an official body does NOT make an item political. Ordinary policy and administration news is IN SCOPE.
+
+OUT OF SCOPE — mark unusable:
+- Party politics, elections, campaign claims, and who-said-what political rows.
+- Communal or religious conflict, or anything that frames a religious community.
+- Protests, police conduct, and contested accounts of what happened at one.
+- Claims that are the subject of an unresolved public dispute between credible sources.
+- Sexual violence, self-harm, named private individuals as victims, or deaths of identifiable private people. A quiz card is the wrong frame for these."""
+
+VALENCE = """- valence: how the claim reads to a player — "positive" (flattering to India, the government, or an institution), "negative" (alarming, critical, or unflattering), or "neutral". Judge the claim as written, not the source."""
 
 JUDGEABILITY = """A card is only good if a thoughtful player has something to REASON about. The claim must be fully self-contained:
 - Specific: name the concrete thing alleged or announced. Never vague references like "accusations against X" or "a confidential letter" whose contents the player cannot know.
@@ -414,7 +454,10 @@ Each input is a tweet by PIB Fact Check (Indian government) debunking a claim th
 - share_score: honest 1-5 rating of how viral/share-worthy the claim reads (analytics only).
 - category: one of the allowed values.
 - explanation: ONE sentence a player sees after answering, explaining why the claim is false and what PIB Fact Check found. Start with something other than "The claim".
-- usable: judged by the standard below. Fraudulent-website and job-scam alerts ARE usable when phrased as the false promise they made.
+- usable: judged by both standards below. Fraudulent-website and job-scam alerts ARE usable when phrased as the false promise they made.
+{VALENCE}
+
+{SCOPE}
 
 {JUDGEABILITY}
 
@@ -430,14 +473,81 @@ For each input item (a genuine PIB press release with its DATE):
 - claim: the fact as a confident, informal assertion under 200 characters, phrased the way a person would retell it — never press-release officialese. Frame the ANNOUNCEMENT, decision, or event — NOT a tally. Reject any fact whose punchline is a cumulative total, count, or aggregate figure, even reframed as savings or impact: "the government will pay people for reporting dirty highway toilets" is good; "NHAI rewarded 429 commuters", "20,000 Jan Aushadhi centres opened", and "generic medicines saved Indians Rs 45,000 crore" are all BAD (mark them unusable). A single number is allowed only when it IS the surprise (a "Rs 1 lakh crore fund", "the 4th country ever to dock spacecraft") — never a running total. No honorifics, no "today". Must stay factually accurate to the release; for older releases, phrase it so it reads correctly with its DATE (anchor the year when it matters).
 - category: one of the allowed values.
 - explanation: ONE sentence shown after answering, confirming the fact and citing the PIB press release as the source.
-- usable: false if ceremonial, routine administrative business, a tallied statistic (per above), share_score of 3 or less, or it fails the standard below.
+- usable: false if ceremonial, routine administrative business, a tallied statistic (per above), share_score of 3 or less, or it fails either standard below.
+{VALENCE}
+
+{SCOPE}
 
 {JUDGEABILITY}
 
 Return every input item exactly once, using its id."""
 
 
-def normalize_with_claude(client, system: str, items: list, min_share: int = 0) -> tuple:
+FACTCHECK_SYSTEM = f"""You turn debunked misinformation into cards for a real-vs-fake news game.
+
+Each input is an article from an independent Indian fact-checker (Alt News or Factly), with its DATE.
+
+FIRST, DECIDE WHETHER IT IS EVEN A FACT-CHECK. These outlets also publish data journalism, explainers, interviews and media criticism — and THOSE ARTICLES ARE TRUE. If the input is not debunking a specific false claim, mark it unusable. Never invert a true article into a false claim; that would teach players the opposite of reality.
+  IS a debunk: the headline says something is false, misleading, morphed, AI-generated, old, unrelated, or misattributed; or it corrects who/what/where something shows.
+  NOT a debunk: a headline that simply reports a finding or statistic — "Ten States Account for 84% of India's Stampede Deaths" is a true data story. Mark unusable.
+
+Your job is to recover THE FALSE CLAIM ITSELF as it circulated — the proposition people actually believed — NOT the article's description of the debunking.
+
+Many fact-checks concern miscaptioned photos or video. For those, extract THE PROPOSITION THE MEDIA WAS USED TO SUPPORT:
+  "Old Mumbai video falsely circulated as Naseeruddin Shah joining the stir"
+     -> claim: "Naseeruddin Shah joined the Jantar Mantar protest"  (but see SCOPE — protests are out)
+  "Viral 'pen bomb' warning messages baseless; police refute rumour"
+     -> claim: "Pens rigged as bombs are being planted in public places"
+If no standalone proposition survives — the fact-check is purely about where an image came from, with no claim a player could weigh — mark it unusable.
+
+- claim: the FALSE claim as a confident assertion under 200 characters, in casual informal English, the way it actually circulated. Never use the words "fake", "false", "debunked", "viral", "rumour", or lead with "No,". No hashtags, no emoji.
+- share_score: honest 1-5 for how share-worthy the claim reads.
+- category: one of the allowed values.
+{VALENCE}
+- explanation: ONE sentence stating what the fact-checkers actually found. Name the outlet's finding, not the outlet's opinion.
+- usable: judged by both standards below.
+
+{SCOPE}
+
+{JUDGEABILITY}
+
+Return every input item exactly once, using its id."""
+
+
+NEWS_SYSTEM = f"""You turn genuine Indian news into cards for a real-vs-fake news game.
+
+Each input is a headline and summary from a mainstream Indian news outlet, with its DATE. Everything here is TRUE. Your job is to turn it into a claim that does NOT look obviously true.
+
+- Find the single most share-worthy fact. Would a person forward this to a friend? Routine local municipal items ("expert team inspects sewage plant sites") have no such fact — mark them unusable. That is expected for most inputs.
+- CRITICAL: do NOT select only flattering stories. Negative and neutral true news — failures, shortfalls, court rulings, price rises, disasters, criticism of institutions, things that went wrong — makes the BEST cards, because players wrongly assume that unflattering means fake. Actively prefer these when the input offers them.
+- claim: under 200 characters, confident and informal, the way a person would retell it. AT MOST one number, rounded the way people speak. No honorifics, no "today". Anchor the year when it matters.
+- Use ONLY facts stated in the headline and summary. If the summary is too thin to support a specific claim, mark it unusable — never infer or embellish.
+- category: one of the allowed values.
+{VALENCE}
+- explanation: ONE sentence confirming the fact and citing the reporting outlet as the source.
+- usable: false for opinion, analysis, editorials, "why X matters" explainers, listicles, previews of upcoming events, share_score of 3 or less, or if it fails either standard below.
+
+{SCOPE}
+
+{JUDGEABILITY}
+
+Return every input item exactly once, using its id."""
+
+
+def accept_real(card: dict) -> bool:
+    """Gate for REAL cards.
+
+    Share-worthiness keeps the pool competitive with viral fakes, but a
+    merely-interesting UNFLATTERING truth is worth more to this game than a
+    dazzling flattering one: players wrongly assume unflattering means fake,
+    so those cards are where the learning happens. Hold them to a lower bar.
+    """
+    score = card["share_score"]
+    return score >= 4 or (score >= 3 and card["valence"] != "positive")
+
+
+def normalize_with_claude(client, system: str, items: list, min_share: int = 0,
+                          accept=None) -> tuple:
     """items: [{id, text, date}] -> (validated card dicts, unusable real ids).
 
     Claude only ever sees short synthetic ids (batch positions) so it cannot
@@ -495,7 +605,8 @@ def normalize_with_claude(client, system: str, items: list, min_share: int = 0) 
             # than dropping the item into permanent retry limbo.
             score = card.get("share_score")
             score = score if isinstance(score, int) and 1 <= score <= 5 else 0
-            if not card["usable"] or score < min_share:
+            ok = accept(card) if accept else score >= min_share
+            if not card["usable"] or not ok:
                 unusable.append(real_id)
                 continue
             claim = card["claim"].strip()
@@ -507,7 +618,8 @@ def normalize_with_claude(client, system: str, items: list, min_share: int = 0) 
                 warn(f"{real_id}: bad explanation; dropping")
                 continue
             cards_out.append({"id": real_id, "claim": claim,
-                              "category": card["category"], "explanation": expl})
+                              "category": card["category"],
+                              "valence": card["valence"], "explanation": expl})
         time.sleep(0.5)
     return cards_out, unusable
 
@@ -529,14 +641,16 @@ def main() -> None:
         existing = fetch_existing_source_ids(cfg)
         log(f"supabase: {len(existing)} existing cards")
 
-    # ---- FAKE pool ------------------------------------------------------
-    tweets = fetch_syndication_tweets()
+    # ---- gather candidates from every source ----------------------------
+    # Each pool carries its own prompt. Item ids ARE the final source_id, so
+    # dedup, tombstoning, URL and date lookup all key off one value.
+    urls, stypes, dates, pools = {}, {}, {}, []
 
+    # 1. PIB Fact Check tweets (FAKE) — static archive, still the core set
+    tweets = fetch_syndication_tweets()
     sindoor_ids = fetch_sindoor_tweet_ids()
-    oembed_needed = [
-        tid for tid in sindoor_ids
-        if tid not in tweets and f"tweet:{tid}" not in existing
-    ]
+    oembed_needed = [t for t in sindoor_ids
+                     if t not in tweets and f"tweet:{t}" not in existing]
     oembed_fail = 0
     for tid in oembed_needed:
         info = fetch_tweet_via_oembed(tid)
@@ -548,91 +662,105 @@ def main() -> None:
     if oembed_needed:
         log(f"oembed: resolved {len(oembed_needed) - oembed_fail}/{len(oembed_needed)}")
         if oembed_fail > len(oembed_needed) * 0.8 and len(oembed_needed) > 5:
-            warn("most oEmbed lookups failed — X may be rate-limiting or the endpoint changed")
+            warn("most oEmbed lookups failed — X may be rate-limiting or endpoint changed")
 
-    new_tweets = [
-        {"id": tid, "text": info["text"], "date": info["date"]}
-        for tid, info in tweets.items()
-        if info["lang"] == "en" and f"tweet:{tid}" not in existing
-    ][:MAX_NEW_TWEETS_PER_RUN]
-    log(f"fake pool: {len(new_tweets)} new English tweets to normalize")
-
-    # ---- REAL pool ------------------------------------------------------
-    releases = fetch_release_list()
-    new_releases = []
-    for prid, title in releases:
-        if f"pib:{prid}" in existing:
+    pib_fakes = []
+    for tid, info in tweets.items():
+        sid = f"tweet:{tid}"
+        if info["lang"] != "en" or sid in existing:
             continue
-        if len(new_releases) >= MAX_NEW_RELEASES_PER_RUN:
+        pib_fakes.append({"id": sid, "text": info["text"], "date": info["date"],
+                          "source_type": "factcheck:pib"})
+        urls[sid] = f"https://x.com/PIBFactCheck/status/{tid}"
+    pib_fakes = pib_fakes[:MAX_NEW_TWEETS_PER_RUN]
+    log(f"pib fact-check tweets: {len(pib_fakes)} to normalize")
+    pools.append(("pib-factcheck", "FAKE", pib_fakes, FAKE_SYSTEM, 0))
+
+    # 2. Independent fact-checkers (FAKE) — daily-updating, broad topics
+    log("independent fact-checkers:")
+    fc_items = [i for i in feeds.fetch_factcheck_candidates(pages=FACTCHECK_PAGES)
+                if i["id"] not in existing][:MAX_NEW_FACTCHECK_PER_RUN]
+    for i in fc_items:
+        urls[i["id"]] = i["url"]
+    log(f"independent fact-checks: {len(fc_items)} to normalize")
+    pools.append(("independent-factcheck", "FAKE", fc_items, FACTCHECK_SYSTEM, 0))
+
+    # 3. PIB press releases (REAL) — the flattering side, share-gated
+    releases = fetch_release_list()
+    pib_reals = []
+    for prid, title in releases:
+        sid = f"pib:{prid}"
+        if sid in existing:
+            continue
+        if len(pib_reals) >= MAX_NEW_RELEASES_PER_RUN:
             break
         detail = fetch_release_body(prid)
         if detail is None:
             warn(f"release {prid}: no usable body; skipping")
             continue
-        new_releases.append({
-            "id": prid,
-            "text": f"TITLE: {title}\nBODY: {detail['body']}",
-            "date": detail["date"],
-        })
+        pib_reals.append({"id": sid, "text": f"TITLE: {title}\nBODY: {detail['body']}",
+                          "date": detail["date"], "source_type": "release:pib"})
+        urls[sid] = f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={prid}"
         time.sleep(0.3)
-    log(f"real pool: {len(new_releases)} new releases to normalize")
+    log(f"pib press releases: {len(pib_reals)} to normalize")
+    pools.append(("pib-release", "REAL", pib_reals, REAL_SYSTEM, 4))
 
-    if not new_tweets and not new_releases:
+    # 4. Mainstream news (REAL) — supplies the negative/neutral true claims
+    #    that kill the "unflattering must be fake" heuristic
+    log("news feeds:")
+    news_items = [i for i in feeds.fetch_news_candidates(pages=NEWS_PAGES)
+                  if i["id"] not in existing][:MAX_NEW_NEWS_PER_RUN]
+    for i in news_items:
+        urls[i["id"]] = i["url"]
+    log(f"news items: {len(news_items)} to normalize")
+    pools.append(("news", "REAL", news_items, NEWS_SYSTEM, 0))
+
+    if not any(p[2] for p in pools):
         log("nothing new to do; exiting cleanly")
         return
 
     # ---- normalize ------------------------------------------------------
-    # Fakes are kept regardless of virality (they are real misinformation);
-    # reals must clear a share-worthiness bar so they can stand next to them.
-    fake_cards, fake_skip = (normalize_with_claude(client, FAKE_SYSTEM, new_tweets)
-                             if new_tweets else ([], []))
-    real_cards, real_skip = (normalize_with_claude(client, REAL_SYSTEM, new_releases,
-                                                    min_share=4)
-                             if new_releases else ([], []))
-
-    for pool, inputs, cards, skips in (("fake", new_tweets, fake_cards, fake_skip),
-                                       ("real", new_releases, real_cards, real_skip)):
-        if inputs and (len(cards) + len(skips)) < len(inputs) * 0.5:
+    cards, skips = [], []
+    for label, verdict, items, prompt, min_share in pools:
+        if not items:
+            continue
+        for it in items:
+            dates[it["id"]] = it.get("date")
+            stypes[it["id"]] = it.get("source_type", label)
+        got, skipped = normalize_with_claude(
+            client, prompt, items, min_share=min_share,
+            accept=accept_real if verdict == "REAL" else None)
+        if (len(got) + len(skipped)) < len(items) * 0.5:
             raise HarvestError(
-                f"{pool} pool: only {len(cards) + len(skips)}/{len(inputs)} items "
-                "processed cleanly — prompt or source drift; refusing to write"
-            )
+                f"{label}: only {len(got) + len(skipped)}/{len(items)} items processed "
+                "cleanly — prompt or source drift; refusing to write")
+        for c in got:
+            cards.append({**c, "verdict": verdict})
+        skips += [(sid, verdict) for sid in skipped]
+        log(f"  {label}: {len(got)} cards, {len(skipped)} unusable")
 
-    def row(card, verdict, url, date, tombstone=False):
-        return {
-            "source_id": None,  # filled in by the caller
-            "verdict": verdict,
-            "claim": card["claim"] if not tombstone else "[skipped during normalization]",
-            "category": card["category"] if not tombstone else "misc",
-            "explanation": card["explanation"] if not tombstone
-            else "Source item judged unusable for the game.",
-            "source_url": url,
-            "source_date": date,
-            "active": not tombstone,
-        }
+    fake_cards = [c for c in cards if c["verdict"] == "FAKE"]
+    real_cards = [c for c in cards if c["verdict"] == "REAL"]
 
-    dates = {it["id"]: it["date"] for it in new_tweets + new_releases}
+    # ---- rows -----------------------------------------------------------
     rows = []
-    for c in fake_cards:
-        r = row(c, "FAKE", f"https://x.com/PIBFactCheck/status/{c['id']}", dates.get(c["id"]))
-        r["source_id"] = f"tweet:{c['id']}"
-        rows.append(r)
-    for c in real_cards:
-        r = row(c, "REAL", f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={c['id']}",
-                dates.get(c["id"]))
-        r["source_id"] = f"pib:{c['id']}"
-        rows.append(r)
-    # tombstones: recorded inactive so they are never re-normalized
-    for sid in fake_skip:
-        r = row(None, "FAKE", f"https://x.com/PIBFactCheck/status/{sid}",
-                dates.get(sid), tombstone=True)
-        r["source_id"] = f"tweet:{sid}"
-        rows.append(r)
-    for sid in real_skip:
-        r = row(None, "REAL", f"https://www.pib.gov.in/PressReleasePage.aspx?PRID={sid}",
-                dates.get(sid), tombstone=True)
-        r["source_id"] = f"pib:{sid}"
-        rows.append(r)
+    for c in cards:
+        rows.append({
+            "source_id": c["id"], "verdict": c["verdict"], "claim": c["claim"],
+            "category": c["category"], "valence": c["valence"],
+            "explanation": c["explanation"], "source_url": urls.get(c["id"], ""),
+            "source_date": dates.get(c["id"]),
+            "source_type": stypes.get(c["id"], "unknown"), "active": True,
+        })
+    for sid, verdict in skips:
+        rows.append({
+            "source_id": sid, "verdict": verdict,
+            "claim": "[skipped during normalization]", "category": "misc",
+            "valence": "neutral",
+            "explanation": "Source item judged unusable for the game.",
+            "source_url": urls.get(sid, ""), "source_date": dates.get(sid),
+            "source_type": stypes.get(sid, "unknown"), "active": False,
+        })
 
     # Final guard: one row per source_id (Postgres rejects an upsert batch
     # that touches the same conflict key twice). Accepted cards are appended
@@ -646,18 +774,28 @@ def main() -> None:
         warn(f"dropped {len(rows) - len(deduped)} duplicate source_id rows before upsert")
     rows = deduped
 
+    # Valence balance is the metric that matters: if every FAKE is alarming
+    # and every REAL is flattering, players win on tone alone.
+    def valence_mix(pool):
+        n = len(pool) or 1
+        c = collections.Counter(x["valence"] for x in pool)
+        return {v: f"{100*c[v]//n}%" for v in ("positive", "negative", "neutral")}
+
+    log(f"\nvalence mix  FAKE {valence_mix(fake_cards)}")
+    log(f"valence mix  REAL {valence_mix(real_cards)}")
+    pos_fake = sum(1 for c in fake_cards if c["valence"] == "positive")
+    neg_real = sum(1 for c in real_cards if c["valence"] == "negative")
+    log(f"cross-cutting cards: {pos_fake} flattering fakes, {neg_real} unflattering reals")
+
     if dry_run:
-        log(f"DRY RUN: would upsert {len(rows)} rows "
+        log(f"\nDRY RUN: would upsert {len(rows)} rows "
             f"({len(fake_cards)} fake, {len(real_cards)} real, "
-            f"{len(fake_skip) + len(real_skip)} tombstones)")
-        for label, cards, verdict, url_key in (
-            ("FAKE", fake_cards, "FAKE", "tweet"),
-            ("REAL", real_cards, "REAL", "pib"),
-        ):
-            log(f"\n=== {label} samples ({len(cards)}) ===")
-            for c in cards:
-                d = dates.get(c["id"]) or "????"
-                log(f"  [{d[:7]} {c['category']}] {c['claim']}")
+            f"{len(skips)} tombstones)")
+        for label, pool in (("FAKE", fake_cards), ("REAL", real_cards)):
+            log(f"\n=== {label} samples ({len(pool)}) ===")
+            for c in pool[:25]:
+                d = (dates.get(c["id"]) or "????")[:7]
+                log(f"  [{d} {c['valence'][:3]} {c['category']}] {c['claim']}")
         return
 
     # In refresh mode, retire every existing card immediately before writing
@@ -676,8 +814,7 @@ def main() -> None:
     upsert_cards(cfg, rows)
     log(
         f"DONE: upserted {len(fake_cards)} fake + {len(real_cards)} real cards, "
-        f"tombstoned {len(fake_skip) + len(real_skip)} unusable items; "
-        f"{len(new_tweets) + len(new_releases) - len(rows)} left for retry"
+        f"tombstoned {len(skips)} unusable items"
     )
 
 
